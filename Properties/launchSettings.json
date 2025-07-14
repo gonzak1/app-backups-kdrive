@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "app_backups_kdrive": {
+      "commandName": "Project",
+      "commandLineArgs": "--port 7132",
+      "launchBrowser": false
+    }
+  }
+}
