@@ -1,10 +1,16 @@
+using System;
+using System.IO;
 using System.Net;
+using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Threading.Tasks;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
-using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.Primitives;
 
 namespace Daktonis.Function
@@ -64,49 +70,65 @@ namespace Daktonis.Function
                 }
                 var folderId = folderVals.ToString();
 
-                // 3) Create file (temporal)
-                var timestamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
-                var fileName  = $"backup_{timestamp}.txt";
-                var payload   = Encoding.UTF8.GetBytes($"Backup created at {timestamp} UTC");
-                var totalSize = payload.Length;
-
-                // 4) Prepare upload URL (< 1 GB)
-                var uploadUrl =
-                    $"https://api.infomaniak.com/3/drive/{driveId}/upload" +
-                    $"?directory_id={Uri.EscapeDataString(folderId)}" +
-                    $"&file_name={Uri.EscapeDataString(fileName)}" +
-                    $"&total_size={totalSize}";
-
-
-                // 4) Create request with file in body
-                using var content = new ByteArrayContent(payload);
-                content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-
-                using var uploadReq = new HttpRequestMessage(HttpMethod.Post, uploadUrl)
+                // ─────────────────────────────────────────────────────────────────────
+                // download blobs from Azure Blob Storage
+                string? connStr       = Environment.GetEnvironmentVariable("AZURE_STORAGE_CONNECTION_STRING");
+                string? containerName = Environment.GetEnvironmentVariable("AZURE_STORAGE_CONTAINER_NAME");
+                if (string.IsNullOrEmpty(connStr) || string.IsNullOrEmpty(containerName))
                 {
-                    Content = content
-                };
-                uploadReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiToken);
-
-                // 5) Send and wait for answer
-                var uploadResp    = await _http.SendAsync(uploadReq);
-                var uploadContent = await uploadResp.Content.ReadAsStringAsync();
-                _logger.LogInformation("Upload response: {Json}", uploadContent);
-
-                if (!uploadResp.IsSuccessStatusCode)
-                {
-                    _logger.LogError("Error uploading file: {Json}", uploadContent);
-                    var errorResponse = req.CreateResponse(HttpStatusCode.InternalServerError);
-                    await errorResponse.WriteStringAsync("Error uploading backup.");
-                    return errorResponse;
+                    _logger.LogWarning("Missing AZURE_STORAGE_CONNECTION_STRING or AZURE_STORAGE_CONTAINER_NAME.");
                 }
+                else
+                {
+                    var containerClient = new BlobContainerClient(connStr, containerName);
+                    string tempDir = Path.Combine(Path.GetTempPath(), $"kdrive_{driveId}");
+                    Directory.CreateDirectory(tempDir);
 
-                // 6) Ready
-                _logger.LogInformation("✅ Backup '{FileName}' uploaded with succeess.", fileName);
+                    await foreach (BlobItem blobItem in containerClient.GetBlobsAsync())
+                    {
+                        string downloadPath = Path.Combine(tempDir, blobItem.Name);
+                        var blobClient = containerClient.GetBlobClient(blobItem.Name);
+
+                        // Download blob to local file
+                        await blobClient.DownloadToAsync(downloadPath);
+                        _logger.LogInformation("Downloaded blob to {Path}", downloadPath);
+
+                        // Read file bytes
+                        byte[] fileBytes = await File.ReadAllBytesAsync(downloadPath);
+
+                        // Prepare upload URL for this specific blob
+                        string uploadUrl =
+                            $"https://api.infomaniak.com/3/drive/{driveId}/upload" +
+                            $"?directory_id={Uri.EscapeDataString(folderId)}" +
+                            $"&file_name={Uri.EscapeDataString(blobItem.Name)}" +
+                            $"&total_size={fileBytes.Length}";
+
+                        // Upload blob content to KDrive
+                        using var content = new ByteArrayContent(fileBytes);
+                        content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+
+                        using var uploadReq = new HttpRequestMessage(HttpMethod.Post, uploadUrl)
+                        {
+                            Content = content
+                        };
+                        uploadReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiToken);
+
+                        var uploadResp    = await _http.SendAsync(uploadReq);
+                        var uploadContent = await uploadResp.Content.ReadAsStringAsync();
+                        _logger.LogInformation("Upload response for {Name}: {Json}", blobItem.Name, uploadContent);
+
+                        if (!uploadResp.IsSuccessStatusCode)
+                        {
+                            _logger.LogError("Error uploading blob {Name}: {Json}", blobItem.Name, uploadContent);
+                        }
+                    }
+                }
+                // ─────────────────────────────────────────────────────────────────────
+                _logger.LogInformation("✅ All blobs uploaded successfully.");
                 var ok = req.CreateResponse(HttpStatusCode.OK);
-                await ok.WriteStringAsync($"Backup '{fileName}' uploaded with succeess.");
+                await ok.WriteStringAsync("All Azure blobs have been backed up to KDrive.");
                 return ok;
-            }
+            }          
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Unexpected error during backup process.");
