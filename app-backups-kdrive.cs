@@ -30,14 +30,13 @@ namespace Daktonis.Function
         public async Task<HttpResponseData> Run(
             [HttpTrigger(AuthorizationLevel.Anonymous, "get", "post")] HttpRequestData req)
         {
-            _logger.LogInformation("=== Starting simple KDrive backup ===");
+            _logger.LogInformation("=== Starting KDrive backup of all containers ===");
 
             try
             {
-                // 1) Parse all three required (token, drive id and folder id) parameters from the query string
+                // 1) Parse required parameters from query string
                 var qs = QueryHelpers.ParseQuery(req.Url.Query);
 
-                // a) API Token
                 if (!qs.TryGetValue("KDRIVE_API_TOKEN", out StringValues tokenVals) 
                     || StringValues.IsNullOrEmpty(tokenVals))
                 {
@@ -48,7 +47,6 @@ namespace Daktonis.Function
                 }
                 var apiToken = tokenVals.ToString();
 
-                // b) Drive ID
                 if (!qs.TryGetValue("KDRIVE_ID", out StringValues idVals) 
                     || StringValues.IsNullOrEmpty(idVals))
                 {
@@ -59,7 +57,6 @@ namespace Daktonis.Function
                 }
                 var driveId = idVals.ToString();
 
-                // c) Folder ID
                 if (!qs.TryGetValue("KDRIVE_FOLDER_ID", out StringValues folderVals) 
                     || StringValues.IsNullOrEmpty(folderVals))
                 {
@@ -71,19 +68,20 @@ namespace Daktonis.Function
                 var folderId = folderVals.ToString();
 
                 // ─────────────────────────────────────────────────────────────────────
-                // download blobs from Azure Blob Storage
-                string? connStr       = Environment.GetEnvironmentVariable("AZURE_STORAGE_CONNECTION_STRING");
-                string? containerName = Environment.GetEnvironmentVariable("AZURE_STORAGE_CONTAINER_NAME");
-                if (string.IsNullOrEmpty(connStr) || string.IsNullOrEmpty(containerName))
+                // DOWNLOAD & UPLOAD: iterate all Azure blob containers
+                string connStr = Environment.GetEnvironmentVariable("AZURE_STORAGE_CONNECTION_STRING")!;
+                var serviceClient = new BlobServiceClient(connStr);
+
+                await foreach (BlobContainerItem containerItem in serviceClient.GetBlobContainersAsync())
                 {
-                    _logger.LogWarning("Missing AZURE_STORAGE_CONNECTION_STRING or AZURE_STORAGE_CONTAINER_NAME.");
-                }
-                else
-                {
-                    var containerClient = new BlobContainerClient(connStr, containerName);
-                    string tempDir = Path.Combine(Path.GetTempPath(), $"kdrive_{driveId}");
+                    string containerName = containerItem.Name;
+                    var containerClient = serviceClient.GetBlobContainerClient(containerName);
+
+                    // Temporary folder per container
+                    string tempDir = Path.Combine(Path.GetTempPath(), $"kdrive_{driveId}_{containerName}");
                     Directory.CreateDirectory(tempDir);
 
+                    // Download & upload each blob
                     await foreach (BlobItem blobItem in containerClient.GetBlobsAsync())
                     {
                         string downloadPath = Path.Combine(tempDir, blobItem.Name);
@@ -91,19 +89,18 @@ namespace Daktonis.Function
 
                         // Download blob to local file
                         await blobClient.DownloadToAsync(downloadPath);
-                        _logger.LogInformation("Downloaded blob to {Path}", downloadPath);
+                        _logger.LogInformation("Downloaded {Blob} from {Container}", blobItem.Name, containerName);
 
                         // Read file bytes
                         byte[] fileBytes = await File.ReadAllBytesAsync(downloadPath);
 
-                        // Prepare upload URL for this specific blob
+                        // Prepare KDrive upload URL, preserving container name in path
                         string uploadUrl =
                             $"https://api.infomaniak.com/3/drive/{driveId}/upload" +
                             $"?directory_id={Uri.EscapeDataString(folderId)}" +
-                            $"&file_name={Uri.EscapeDataString(blobItem.Name)}" +
+                            $"&file_name={Uri.EscapeDataString($"{containerName}/{blobItem.Name}")}" +
                             $"&total_size={fileBytes.Length}";
 
-                        // Upload blob content to KDrive
                         using var content = new ByteArrayContent(fileBytes);
                         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
 
@@ -113,22 +110,22 @@ namespace Daktonis.Function
                         };
                         uploadReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiToken);
 
-                        var uploadResp    = await _http.SendAsync(uploadReq);
-                        var uploadContent = await uploadResp.Content.ReadAsStringAsync();
-                        _logger.LogInformation("Upload response for {Name}: {Json}", blobItem.Name, uploadContent);
-
-                        if (!uploadResp.IsSuccessStatusCode)
+                        var resp = await _http.SendAsync(uploadReq);
+                        var body = await resp.Content.ReadAsStringAsync();
+                        _logger.LogInformation("Uploaded {Blob}→KDrive: {Status}", blobItem.Name, resp.StatusCode);
+                        if (!resp.IsSuccessStatusCode)
                         {
-                            _logger.LogError("Error uploading blob {Name}: {Json}", blobItem.Name, uploadContent);
+                            _logger.LogError("Failed uploading {Blob}: {Body}", blobItem.Name, body);
                         }
                     }
                 }
                 // ─────────────────────────────────────────────────────────────────────
-                _logger.LogInformation("✅ All blobs uploaded successfully.");
+
+                _logger.LogInformation("✅ All blobs from all containers backed up.");
                 var ok = req.CreateResponse(HttpStatusCode.OK);
                 await ok.WriteStringAsync("All Azure blobs have been backed up to KDrive.");
                 return ok;
-            }          
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Unexpected error during backup process.");
